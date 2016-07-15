@@ -46,6 +46,10 @@ class Constructor(ADTConstructor):
         )
         return a
 
+    @staticmethod
+    def __or__(other):
+        return NotImplemented
+
 
 class NoMatch(Exception):
     """Raised to indicate that the alternative does not match the expression.

@@ -1,7 +1,7 @@
 from collections import OrderedDict
 from functools import total_ordering
 
-from toolz import concatv, memoize
+from toolz import concatv, memoize, identity
 import toolz.curried.operator as op
 
 
@@ -66,6 +66,8 @@ class Constructor:
             ', '.join(map(op.mod('%s=%s'), self._kwargs.items())),
         )
     __str__ = __repr__
+
+    __or__ = staticmethod(identity)
 
 
 @total_ordering
