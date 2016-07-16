@@ -1,50 +1,87 @@
-from inspect import signature
+import builtins
 from functools import partial
 
-from fz import placeholder
-from toolz import curry
+from lazy import thunk, strict, operator as op
+from lazy.tree import LTree
+from toolz import compose, curry, flip, drop
 
-from .adt import mk_prepare_structure, Constructor as ADTConstructor
+from .adt import mk_prepare_structure, Constructor as ADTConstructor, TypeVar
+
+
+def lookup_name(name, locals_, globals_):
+    try:
+        return locals_[name]
+    except KeyError:
+        pass
+
+    try:
+        return globals_[name]
+    except KeyError:
+        pass
+
+    try:
+        getattr(builtins, name)
+    except AttributeError:
+        raise NameError(name)
+
+
+@object.__new__
+class any_typevar:
+    __eq__ = staticmethod(flip(isinstance, TypeVar))
+
+
+class RegisteringThunk(thunk):
+    def __new__(cls, *args, **kwargs):
+        return super().__new__(cls, lambda: Constructor(*args, **kwargs))
+
+    def __rshift__(self, other):
+        return strict(self) >> other
 
 
 class Constructor(ADTConstructor):
     __slots__ = '_constructors',
 
     def __init__(self, constructors, name, *args, **kwargs):
+        already_bound = {}
+        for n, arg in enumerate(args):
+            if arg in already_bound:
+                raise TypeError(
+                    'argument %r at position %d is already bound to the'
+                    ' positional argument at index %d' % (
+                        arg,
+                        n,
+                        already_bound[arg],
+                    ),
+                )
+            already_bound[arg] = n
+
+        for k, arg in kwargs.items():
+            if arg in already_bound:
+                loc = already_bound[arg]
+                raise TypeError(
+                    'argument %r at keyword %s is already bound to the %s' % (
+                        arg,
+                        k,
+                        ('positional argument at index %d' % loc)
+                        if isinstance(loc, int) else
+                        ('keyword argument %r' % loc),
+                    ),
+                )
+
         super().__init__(constructors, name, *args, **kwargs)
         del constructors[name]
         self._constructors = constructors
 
     def __rshift__(self, other):
-        if callable(other):
-            args = signature(other).parameters
-            expr = other
-        else:
-            args = ()
-            expr = lambda other=other: other
-
-        positional_names = set(a._name for a in self._args)
-        keyword_names = {v._name: k for k, v in self._kwargs.items()}
-        new_names = positional_names | keyword_names.keys()
-        used_args = set()
-        used_kwargs = {}
-        for n, argname in enumerate(args):
-            if argname not in new_names:
-                raise NameError('name %r not defined' % argname)
-            if argname in positional_names:
-                used_args.add(n)
-            else:
-                used_kwargs[argname] = keyword_names[argname]
-
-        self._constructors[self._name] = a = Alternative(
+        if_not_alt = thunk(op.rshift, self, other)
+        self._constructors[self._name] = Alternative(
             self._name,
-            len(self._args),
-            self._kwargs.keys(),
-            tuple(used_args),
-            used_kwargs,
-            expr,
+            self._args,
+            self._kwargs,
+            other,
+            if_not_alt,
         )
-        return a
+        return if_not_alt
 
     @staticmethod
     def __or__(other):
@@ -59,37 +96,36 @@ class NoMatch(Exception):
 class Alternative:
     __slots__ = (
         '_constructor_name',
-        '_nargs',
-        '_kwargkeys',
-        '_used_args',
-        '_used_kwargs',
+        '_argnames',
+        '_kwargnames',
         '_expr',
+        '_if_not_alt',
     )
 
     def __init__(self,
                  constructor_name,
-                 nargs,
-                 kwargkeys,
-                 used_args,
-                 used_kwargs,
-                 expr):
+                 argnames,
+                 kwargnames,
+                 expr,
+                 if_not_alt):
         self._constructor_name = constructor_name
-        self._nargs = nargs
-        self._kwargkeys = kwargkeys
-        self._used_args = used_args
-        self._used_kwargs = used_kwargs
+        self._argnames = argnames
+        self._kwargnames = kwargnames
         self._expr = expr
+        self._if_not_alt = if_not_alt
 
     def scrutinize(self, scrutine):
         constructor = type(scrutine)
         if constructor.__name__ != self._constructor_name:
             raise NoMatch()
-        args = scrutine._args
+
         kwargs = scrutine._kwargs
-        return self._expr(
-            *(args[n] for n in self._used_args),
-            **{k: kwargs[v] for k, v in self._used_kwargs.items()}
-        )
+        tree = LTree.parse(self._expr).subs({
+            k: v for k, v in zip(self._argnames, scrutine._args)
+        })
+        return strict(tree.subs({
+            v: kwargs[k] for k, v in self._kwargnames.items()
+        }).lcompile())
 
     def __repr__(self):
         return self._constructor_name
@@ -108,22 +144,22 @@ def scrutinize(alternatives, scrutinee):
                 '%r is not a valid constructor of type: %r' % (name, adt),
             )
         nargs, kwargkeys = constructors[name]
-        if alternative._nargs != nargs:
+        if len(alternative._argnames) != nargs:
             raise TypeError(
                 'invalid alternative for %r constructor, expected %d'
                 ' positional arguments but received %d' % (
                     name,
                     nargs,
-                    alternative._nargs,
+                    len(alternative._argnames),
                 ),
             )
-        if alternative._kwargkeys != kwargkeys:
+        if alternative._kwargnames.keys() != kwargkeys:
             raise TypeError(
                 'invalid alternative for %r constructor, mismatched keyword'
                 ' arguments, expected %s but received %s' % (
                     name,
                     set(kwargkeys),
-                    set(alternative._kwargkeys),
+                    set(alternative._kwargnames),
                 ),
             )
 
@@ -161,12 +197,28 @@ class CaseMeta(type):
                 dict_
             )
 
-        return partial(scrutinize, dict_._constructors.values())
+        alttrees = {
+            LTree.parse(alt._if_not_alt): alt
+            for alt in dict_._constructors.values()
+        }
+        altconstructors = {
+            k.args[0]: v for k, v in alttrees.items()
+        }
+        for alt, expr in alttrees.items():
+            # drop the first element of the iter because it is the node itself
+            for leaf in alt.leaves():
+                try:
+                    if altconstructors[leaf] is not expr:
+                        del altconstructors[leaf]
+                except (KeyError, TypeError):
+                    pass
+
+        return partial(scrutinize, altconstructors.values())
 
     __prepare__ = mk_prepare_structure(
         no_recursive_type,
         Constructor,
-        placeholder,
+        compose(thunk.fromexpr, TypeVar),
     )
 
 
