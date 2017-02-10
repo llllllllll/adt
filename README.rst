@@ -150,11 +150,16 @@ For example:
    ...     B(a=_1, b=_2) >> _1 - _2
    3
 
-   >>> @print
-   ... @match(List[int].Cons(1, List[int].Nil()))
+
+Case alternatives are executed lazily, this means that **only** the alternative
+expression entered will be evaluated:
+
+.. code-block:: python
+
+   >>> @match(List[int].Cons(1, List[int].Nil()))
    ... class _(case):
-   ...     Nil() >> 'empty'
-   ...     Cons(_1, _2) >> 'not empty'
+   ...     Nil() >> print('empty')  # note: not printed!
+   ...     Cons(_1, _2) >> print('not empty')
    not empty
 
 

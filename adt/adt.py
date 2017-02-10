@@ -36,7 +36,7 @@ class RecursiveType:
         self._types = types
 
     def __repr__(self):
-        return '%s(%s)' % (
+        return '%s[%s]' % (
             self._name,
             ', '.join(map(str, self._types)),
         )
@@ -179,7 +179,7 @@ def adt(base, types):
         argtypes = list(constructor._args)
         for n, argtype in enumerate(argtypes):
             if (isinstance(argtype, RecursiveType) and
-                argtype._name == base.__name__):
+                    argtype._name == base.__name__):
                 # recursive structure
                 recursive_types = tuple(_types[var] for var in argtype._types)
                 argtypes[n] = (
@@ -192,7 +192,7 @@ def adt(base, types):
         kwargtypes = dict(constructor._kwargs)
         for k, kwargtype in constructor._kwargs.items():
             if (isinstance(kwargtype, RecursiveType) and
-                kwargtype._name == base.__name__):
+                    kwargtype._name == base.__name__):
                 # recursive structure
                 recursive_types = tuple(
                     _types[var] for var in kwargtype._types
@@ -221,10 +221,7 @@ def adt(base, types):
     return ADTImpl
 
 
-_valid_arg_names = frozenset({'_%d' % (n + 1) for n in range(255)})
-
-
-def mk_prepare_structure(RecursiveType, Constructor, TypeVar):
+def mk_prepare_structure(RecursiveType, Constructor, TypeVar, valid_arg_names):
     class __prepare__(dict):
         def __init__(self, instance, owner):
             super().__init__()
@@ -249,7 +246,7 @@ def mk_prepare_structure(RecursiveType, Constructor, TypeVar):
                     self._constructors,
                 )
 
-            if key not in _valid_arg_names:
+            if key not in valid_arg_names:
                 return super().__getitem__(key)
 
             self._typevars[key] = v = TypeVar(key)
@@ -272,7 +269,6 @@ class ADTMeta(type):
                 )
                 for t in types:
                     if isinstance(t, RecursiveType) and t._name != name:
-                        from nose.tools import set_trace;set_trace()
                         raise TypeError(
                             'recursive type name must be the same as the type'
                             ' name, %r != %r' % (
@@ -289,7 +285,12 @@ class ADTMeta(type):
                 return adt(self, ())
         return self
 
-    __prepare__ = mk_prepare_structure(RecursiveType, Constructor, TypeVar)
+    __prepare__ = mk_prepare_structure(
+        RecursiveType,
+        Constructor,
+        TypeVar,
+        frozenset({'_%d' % (n + 1) for n in range(255)}),
+    )
 
     def __getitem__(self, types):
         if not isinstance(types, tuple):

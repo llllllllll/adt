@@ -1,33 +1,12 @@
 import builtins
 from functools import partial
+import sys
 
 from lazy import thunk, strict, operator as op
-from lazy.tree import LTree
-from toolz import compose, curry, flip, drop
+from lazy.tree import LTree, Call, Normal
+from toolz import curry, merge, valmap
 
-from .adt import mk_prepare_structure, Constructor as ADTConstructor, TypeVar
-
-
-def lookup_name(name, locals_, globals_):
-    try:
-        return locals_[name]
-    except KeyError:
-        pass
-
-    try:
-        return globals_[name]
-    except KeyError:
-        pass
-
-    try:
-        getattr(builtins, name)
-    except AttributeError:
-        raise NameError(name)
-
-
-@object.__new__
-class any_typevar:
-    __eq__ = staticmethod(flip(isinstance, TypeVar))
+from .adt import mk_prepare_structure, Constructor as ADTConstructor
 
 
 class RegisteringThunk(thunk):
@@ -38,10 +17,41 @@ class RegisteringThunk(thunk):
         return strict(self) >> other
 
 
+def name_lookup(name):
+    """A box to hold a name lookup, we lookup the value from the LTree.
+
+    If we ever evaluate this it means that it didn't get subs'd out in the name
+    substitution step so it was not in scope.
+    """
+    raise NameError(name)
+
+
+class capture_string:
+    def __init__(self):
+        self.value = None
+
+    def __eq__(self, other):
+        if isinstance(other, str):
+            self.value = other
+            return True
+        return False
+
+
 class Constructor(ADTConstructor):
     __slots__ = '_constructors',
 
+    @staticmethod
+    def _unwrap_name(arg):
+        name = capture_string()
+        if LTree.parse(arg) != Call(Normal(name_lookup), (Normal(name),), {}):
+            # this should actually be a recursive destructure like in haskell
+            # but I haven't gotten to that yet
+            raise SyntaxError("can't assign to expression")
+        return name.value
+
     def __init__(self, constructors, name, *args, **kwargs):
+        args = tuple(map(self._unwrap_name, args))
+        kwargs = valmap(self._unwrap_name, kwargs)
         already_bound = {}
         for n, arg in enumerate(args):
             if arg in already_bound:
@@ -72,7 +82,24 @@ class Constructor(ADTConstructor):
         del constructors[name]
         self._constructors = constructors
 
+    _literal_conversions = {
+        list: lambda es: thunk(lambda *es: list(es), *es),
+        set: lambda es: thunk(lambda *es: set(es), *es),
+        tuple: lambda es: thunk(lambda *es: tuple(es), *es),
+        dict: lambda d: thunk(dict, **d),
+    }
+
+    def _box_literal(self, collection):
+        """We are not using ``lazy_function`` to wrap the class body so
+        literal values are not thunks.
+        """
+        try:
+            return self._literal_conversions[type(collection)](collection)
+        except KeyError:
+            return thunk.fromexpr(collection)
+
     def __rshift__(self, other):
+        other = self._box_literal(other)
         if_not_alt = thunk(op.rshift, self, other)
         self._constructors[self._name] = Alternative(
             self._name,
@@ -114,24 +141,32 @@ class Alternative:
         self._expr = expr
         self._if_not_alt = if_not_alt
 
-    def scrutinize(self, scrutine):
+    def scrutinize(self, scrutine, context_frame):
         constructor = type(scrutine)
         if constructor.__name__ != self._constructor_name:
             raise NoMatch()
 
         kwargs = scrutine._kwargs
-        tree = LTree.parse(self._expr).subs({
-            k: v for k, v in zip(self._argnames, scrutine._args)
-        })
-        return strict(tree.subs({
-            v: kwargs[k] for k, v in self._kwargnames.items()
-        }).lcompile())
+        # the context to evaluate the thunk in
+        context = {
+            Call(Normal(name_lookup), (Normal(name),), {}): Normal(value)
+            for name, value in merge(
+                vars(builtins),
+                context_frame.f_globals,
+                context_frame.f_locals,
+                # the newly bound arguments have the highest precedence
+                dict(zip(self._argnames, scrutine._args)),
+                {v: kwargs[k] for k, v in self._kwargnames.items()},
+            ).items()
+        }
+        bound_tree = LTree.parse(self._expr).subs(context)
+        return strict(bound_tree.lcompile())
 
     def __repr__(self):
         return self._constructor_name
 
 
-def scrutinize(alternatives, scrutinee):
+def scrutinize(alternatives, scrutinee, context_frame=None):
     # validate the case statement based on the scrutinee
     adt = scrutinee._adt
     constructors = {
@@ -163,9 +198,12 @@ def scrutinize(alternatives, scrutinee):
                 ),
             )
 
+    if context_frame is None:
+        # the calling frame
+        context_frame = sys._getframe(1)
     for alternative in alternatives:
         try:
-            return alternative.scrutinize(scrutinee)
+            return alternative.scrutinize(scrutinee, context_frame)
         except NoMatch:
             pass
     raise NoMatch(
@@ -179,6 +217,12 @@ def scrutinize(alternatives, scrutinee):
 
 def no_recursive_type(*args, **kwargs):
     raise TypeError('cannot use recursive types in case statements')
+
+
+@object.__new__
+class everything:
+    def __contains__(self, other):
+        return True
 
 
 class CaseMeta(type):
@@ -218,7 +262,8 @@ class CaseMeta(type):
     __prepare__ = mk_prepare_structure(
         no_recursive_type,
         Constructor,
-        compose(thunk.fromexpr, TypeVar),
+        partial(thunk, name_lookup),
+        everything,
     )
 
 
@@ -233,9 +278,9 @@ def match(data, case):
 
     Examples
     --------
-    >>> @match(data)
+    >>> @match(data)  # doctest: +SKIP
     ... class result(case):
     ...     Constructor(...) >> some_expr
     ...     ...
     """
-    return case(data)
+    return case(data, context_frame=sys._getframe(2))
